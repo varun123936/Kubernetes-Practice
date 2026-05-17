@@ -16,7 +16,14 @@ provider "aws" {
 ############################
 
 variable "cluster_version" {
-  default = "1.35"
+  description = "Amazon EKS Kubernetes version."
+  default     = "1.35"
+}
+
+variable "key_name" {
+  description = "Optional EC2 key pair name for SSH access to the helper instance."
+  type        = string
+  default     = "threetier"
 }
 
 ############################
@@ -49,6 +56,11 @@ resource "aws_subnet" "public1" {
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "us-east-1a"
   map_public_ip_on_launch = true
+
+  tags = {
+    Name                     = "eks-public-1"
+    "kubernetes.io/role/elb" = "1"
+  }
 }
 
 resource "aws_subnet" "public2" {
@@ -57,6 +69,11 @@ resource "aws_subnet" "public2" {
   cidr_block              = "10.0.2.0/24"
   availability_zone       = "us-east-1b"
   map_public_ip_on_launch = true
+
+  tags = {
+    Name                     = "eks-public-2"
+    "kubernetes.io/role/elb" = "1"
+  }
 }
 
 resource "aws_subnet" "private1" {
@@ -64,6 +81,11 @@ resource "aws_subnet" "private1" {
   vpc_id            = aws_vpc.eks_vpc.id
   cidr_block        = "10.0.3.0/24"
   availability_zone = "us-east-1a"
+
+  tags = {
+    Name                              = "eks-private-1"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
 }
 
 resource "aws_subnet" "private2" {
@@ -71,6 +93,11 @@ resource "aws_subnet" "private2" {
   vpc_id            = aws_vpc.eks_vpc.id
   cidr_block        = "10.0.4.0/24"
   availability_zone = "us-east-1b"
+
+  tags = {
+    Name                              = "eks-private-2"
+    "kubernetes.io/role/internal-elb" = "1"
+  }
 }
 
 ############################
@@ -230,6 +257,63 @@ resource "aws_iam_role_policy_attachment" "ecr" {
 }
 
 ############################
+# IAM ROLE - HELPER EC2
+############################
+
+resource "aws_iam_role" "helper_instance_role" {
+
+  name = "eks-helper-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "helper_ssm" {
+
+  role       = aws_iam_role.helper_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_policy" "helper_eks_access" {
+
+  name        = "eks-helper-access-policy"
+  description = "Allow the helper EC2 instance to discover and describe EKS clusters."
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "eks:DescribeCluster",
+          "eks:ListClusters"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "helper_eks_access" {
+
+  role       = aws_iam_role.helper_instance_role.name
+  policy_arn = aws_iam_policy.helper_eks_access.arn
+}
+
+resource "aws_iam_instance_profile" "helper_instance_profile" {
+  name = "eks-helper-instance-profile"
+  role = aws_iam_role.helper_instance_role.name
+}
+
+############################
 # EKS CLUSTER
 ############################
 
@@ -238,6 +322,11 @@ resource "aws_eks_cluster" "eks" {
   name     = "naresh"
   role_arn = aws_iam_role.cluster_role.arn
   version  = var.cluster_version
+
+  access_config {
+    authentication_mode                         = "API_AND_CONFIG_MAP"
+    bootstrap_cluster_creator_admin_permissions = true
+  }
 
   vpc_config {
 
@@ -270,9 +359,9 @@ resource "aws_eks_node_group" "node_group" {
     aws_subnet.private1.id,
     aws_subnet.private2.id
   ]
-  
-    
-  instance_types = ["t2.medium"]
+
+
+  instance_types = ["c7i-flex.large"]
 
   scaling_config {
 
@@ -294,45 +383,75 @@ resource "aws_eks_node_group" "node_group" {
   }
 }
 
+resource "aws_eks_access_entry" "helper_admin" {
+  cluster_name  = aws_eks_cluster.eks.name
+  principal_arn = aws_iam_role.helper_instance_role.arn
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "helper_cluster_admin" {
+  cluster_name  = aws_eks_cluster.eks.name
+  principal_arn = aws_iam_role.helper_instance_role.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+
+  depends_on = [aws_eks_access_entry.helper_admin]
+}
+
 
 resource "aws_instance" "eks" {
-    ami           = "ami-02dfbd4ff395f2a1b"
-    instance_type = "t2.medium"
-    subnet_id     = aws_subnet.public1.id
-    vpc_security_group_ids = [aws_security_group.allow_all.id]
-    root_block_device {
-      volume_size = "30"
-    }
-   
-    
-    tags = {
-        Name = "eks"
-    }
-    
-    user_data = <<-EOF
-                #!/bin/bash
-                # Update system
-                yum update -y
+  ami                         = "ami-0236922087fa98b6e"
+  instance_type               = "c7i-flex.large"
+  key_name                    = var.key_name
+  subnet_id                   = aws_subnet.public1.id
+  vpc_security_group_ids      = [aws_security_group.allow_all.id]
+  iam_instance_profile        = aws_iam_instance_profile.helper_instance_profile.name
+  user_data_replace_on_change = true
+  root_block_device {
+    volume_size = "30"
+  }
 
-                # ----------------------------- Install kubectl -----------------------------
-                curl -o /tmp/kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.19.6/2021-01-05/bin/linux/amd64/kubectl
-                chmod +x /tmp/kubectl
-                mv /tmp/kubectl /usr/local/bin/kubectl
 
-                # Verify kubectl
-                kubectl version --client || true
+  tags = {
+    Name = "eks"
+  }
 
-                # ----------------------------- Install eksctl -------------------------------
-                curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
-                | tar xz -C /tmp
+  user_data = <<-EOF
+              #!/bin/bash
+              # Update system
+              yum update -y
+              yum install -y curl unzip tar
 
-                mv /tmp/eksctl /usr/local/bin/eksctl
+              # ----------------------------- Install kubectl -----------------------------
+              curl -o /tmp/kubectl https://dl.k8s.io/release/v1.35.3/bin/linux/amd64/kubectl
+              chmod +x /tmp/kubectl
+              mv /tmp/kubectl /usr/local/bin/kubectl
 
-                # Verify eksctl
-                eksctl version || true
+              # Verify kubectl
+              kubectl version --client || true
 
-                EOF
-  
+              # ----------------------------- Install AWS CLI -----------------------------
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+              unzip -o /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install --update
+
+              # Verify AWS CLI
+              aws --version || true
+
+              # ----------------------------- Install eksctl -------------------------------
+              curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" \
+              | tar xz -C /tmp
+
+              mv /tmp/eksctl /usr/local/bin/eksctl
+
+              # Verify eksctl
+              eksctl version || true
+
+              EOF
+
 }
 ############################
 # EKS ADDONS
@@ -391,7 +510,7 @@ resource "aws_iam_role" "ebs_csi_role" {
         Service = "pods.eks.amazonaws.com"
       }
       Action = [
-        "sts:AssumeRole",            
+        "sts:AssumeRole",
         "sts:TagSession"
       ]
     }]
@@ -418,8 +537,8 @@ resource "aws_eks_pod_identity_association" "ebs_csi" {
 
 resource "aws_eks_addon" "ebs_csi" {
 
-  cluster_name = aws_eks_cluster.eks.name
-  addon_name   = "aws-ebs-csi-driver"
+  cluster_name                = aws_eks_cluster.eks.name
+  addon_name                  = "aws-ebs-csi-driver"
   resolve_conflicts_on_update = "OVERWRITE"
 
   depends_on = [

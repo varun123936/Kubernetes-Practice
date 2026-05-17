@@ -12,6 +12,7 @@ It creates:
 - An EKS cluster
 - An EKS managed node group
 - A helper EC2 instance with `kubectl`, `eksctl`, and `awscli`
+- EKS access entry and cluster-admin access for the helper EC2 IAM role
 - EKS addons like VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent, and EBS CSI Driver
 
 ## Why This File Exists
@@ -47,12 +48,14 @@ Instead of creating AWS resources manually in the console, Terraform creates eve
 - One IAM role for the EKS control plane
 - One IAM role for worker nodes
 - One IAM role for the helper EC2 instance
+- The helper EC2 role gets SSM access and EKS read permissions
 - One IAM role for the EBS CSI driver through EKS Pod Identity
 
 ### 5. EKS Cluster
 - Creates the cluster named `naresh`
 - Uses private subnets for the cluster networking
 - Keeps the cluster API endpoint publicly reachable
+- Enables `API_AND_CONFIG_MAP` authentication mode so EKS access entries can be used
 
 ### 6. Node Group
 - Creates managed worker nodes for the cluster
@@ -65,10 +68,17 @@ Instead of creating AWS resources manually in the console, Terraform creates eve
 - Uses your AMI: `ami-0236922087fa98b6e`
 - Uses instance type `c7i-flex.large`
 - Uses SSH key pair `threetier`
-- Installs `kubectl`, `eksctl`, and `awscli`
+- Uses an IAM instance profile instead of hardcoded AWS credentials
+- Installs `kubectl v1.35.3`, latest `awscli`, and `eksctl`
+- Replaces the instance automatically if `user_data` changes
 - Can be used to manage the EKS cluster
 
-### 8. EKS Addons
+### 8. EKS Access For Helper EC2
+- Creates an EKS access entry for the helper EC2 IAM role
+- Associates `AmazonEKSClusterAdminPolicy`
+- This allows the helper EC2 role to access the Kubernetes cluster after kubeconfig is generated
+
+### 9. EKS Addons
 - `vpc-cni` for pod networking
 - `coredns` for cluster DNS
 - `kube-proxy` for service networking
@@ -82,6 +92,7 @@ After `terraform apply`, you will have:
 - A ready EKS cluster
 - Managed worker nodes running in private subnets
 - A helper EC2 machine you can use to connect and manage the cluster
+- Working IAM-based access from the helper EC2 instance to the EKS cluster
 - Core Kubernetes addons already installed
 - Storage support through the EBS CSI driver
 
@@ -125,6 +136,7 @@ flowchart TB
         CR[IAM Role\nEKS Cluster]
         WR[IAM Role\nWorker Nodes]
         HR[IAM Role\nHelper EC2]
+        AE[EKS Access Entry\nCluster Admin Policy]
         PIR[IAM Role\nEBS CSI via Pod Identity]
 
         EKS[EKS Cluster: naresh\nVersion: 1.35]
@@ -134,6 +146,8 @@ flowchart TB
     CR --> EKS
     WR --> NG
     HR --> EC2
+    HR --> AE
+    AE --> EKS
     PIR --> ADDONS
     EKS --> NG
     EKS --> ADDONS
@@ -144,11 +158,37 @@ flowchart TB
 
 1. Terraform creates the VPC, subnets, gateway, routes, and security group.
 2. Terraform creates IAM roles and policy attachments.
-3. Terraform creates the EKS control plane.
+3. Terraform creates the EKS cluster and enables access entry support.
 4. Terraform creates the worker node group in private subnets.
-5. Terraform creates the helper EC2 instance in the public subnet.
-6. Terraform installs the EKS addons.
-7. You connect to the helper EC2 instance and manage the cluster using `kubectl`, `eksctl`, or `aws`.
+5. Terraform creates EKS access for the helper EC2 IAM role.
+6. Terraform creates the helper EC2 instance in the public subnet.
+7. The helper instance installs `kubectl`, `awscli`, and `eksctl` during boot.
+8. Terraform installs the EKS addons.
+9. You connect to the helper EC2 instance and manage the cluster using `kubectl`, `eksctl`, or `aws`.
+
+## Recent Fixes
+
+- Updated the node group from `t2.medium` to `c7i-flex.large`
+- Added `awscli` installation to the helper EC2 bootstrap
+- Updated `kubectl` install to a version aligned with the cluster version
+- Added `user_data_replace_on_change = true` so helper EC2 bootstrap changes take effect on replacement
+- Added EKS access entry and `AmazonEKSClusterAdminPolicy` for the helper EC2 role
+- Enabled EKS authentication mode that supports access entries
+
+## How You Will Use It
+
+After the helper EC2 is ready, the usual commands are:
+
+```bash
+aws eks update-kubeconfig --region us-east-1 --name naresh
+kubectl get nodes
+```
+
+If those commands work, it means:
+- AWS CLI is installed
+- `kubectl` is installed
+- The helper EC2 IAM role can talk to EKS
+- The helper EC2 role is authorized inside the cluster
 
 ## Simple Summary
 
